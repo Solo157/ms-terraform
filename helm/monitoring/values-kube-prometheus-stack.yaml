@@ -1,0 +1,60 @@
+# Prometheus + Grafana + kube-state-metrics + node-exporter. Без отказоустойчивости
+# и долгого хранения. Alertmanager отключён: для демо достаточно сбора и визуализации.
+
+alertmanager:
+  enabled: false
+
+grafana:
+  adminPassword: admin              # только для демо; в настоящем окружении — секрет
+  resources:
+    requests: { cpu: 20m, memory: 128Mi }
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+      - PLACEHOLDER_GRAFANA_HOST     # CI: --set grafana.ingress.hosts[0]=...
+    paths: [ / ]
+    pathType: Prefix
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      access: proxy
+      url: http://loki.logging.svc.cluster.local:3100
+  # Дашборды накатываются sidecar'ом из ConfigMap с лейблом grafana_dashboard=1
+  # (создаёт CI в namespace monitoring). Провайдер One-way off — можно править в UI.
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: monitoring
+      folder: "App"
+      provider:
+        allowUiUpdates: true
+
+prometheus:
+  prometheusSpec:
+    retention: 2d
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+    # Искать ServiceMonitor во всех namespace и не смотреть на метки релиза —
+    # иначе метрики приложения из namespace dev не соберутся.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    # Без этого operator ищет ServiceMonitor только в своём namespace (monitoring).
+    # Явно добавляем dev — там приложение кладёт свои ServiceMonitor. monitoring
+    # оставляем, чтобы self-monitoring-объекты чарта тоже продолжали применяться.
+    serviceMonitorNamespaceSelector:
+      matchNames:
+        - dev
+        - monitoring
+
+nodeExporter:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+
+kube-state-metrics:
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }
+
+defaultRules:
+  create: false

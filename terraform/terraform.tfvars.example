@@ -1,0 +1,27 @@
+# Скопируйте в terraform.tfvars и заполните. НЕ коммитьте terraform.tfvars с
+# реальными значениями.
+#
+# ВАЖНО: дефолты ниже = дефолты variables.tf. CI (см. .tf-base) использует именно
+# дефолты variables.tf и подаёт только yc_cloud_id/yc_folder_id; этот файл — для
+# ЛОКАЛЬНОГО запуска и обязан оставаться согласованным с variables.tf.
+# Локально так же требуются env: YC_SERVICE_ACCOUNT_KEY_FILE (JSON SA) и
+# -backend-config=bucket=<bucket> + AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY.
+
+name         = "otus-ms"
+yc_cloud_id  = "<YC_CLOUD_ID>"
+yc_folder_id = "<YC_FOLDER_ID>"
+
+# Одна зона и одна подсеть (master и воркеры). Не менять без предварительного
+# удаления зависимых ресурсов: смена zone или CIDR уже занятой подсети = ForceNew
+# (пересоздание подсети/кластера/нoд).
+zone        = "ru-central1-d"
+subnet_cidr = "10.10.10.0/24"
+
+# Kubernetes-сети задаются явно, не должны пересекаться с subnet и между собой.
+cluster_ipv4_range = "10.244.0.0/16" # Pod'ы
+service_ipv4_range = "10.96.0.0/16"  # Service (ClusterIP)
+
+node_count     = 1
+node_cores     = 2
+node_memory    = 4
+node_disk_size = 32

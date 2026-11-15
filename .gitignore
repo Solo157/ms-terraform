@@ -1,0 +1,35 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+terraform.tfvars
+terraform.tfvars.json
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# YC / kubeconfig / creds never in git
+kubeconfig*
+*.kubeconfig
+account.key
+yc_token*
+yc_sa_key.json
+.cluster/
+.kube/
+deploy.env
+cluster.env
+kube.env
+tfplan
+**/tfplan
+
+# CI local tool caches (bootstrap cache, terraform plugin cache)
+.cache/
+.terraform.d/
+
+# IDE
+.idea/
+*.iml

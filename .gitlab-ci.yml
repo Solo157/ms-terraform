@@ -1,0 +1,253 @@
+# Инфраструктурный pipeline: Terraform (облако + кластер), затем кластерные
+# компоненты (GitLab Agent, ingress-nginx, мониторинг, логи). terraform_apply и
+# terraform_destroy — ручные; terraform_destroy независим от цепочки (needs: []),
+# поэтому его можно запустить первым. apply/destroy и helm-установки (агент,
+# компоненты) используют ОДИН resource_group `cluster` — поэтому destroy не пойдёт
+# одновременно с install_* из другого пайплайна.
+# Параметры Terraform (зона, CIDR, node group) берутся из дефолтов terraform/variables.tf;
+# CI подаёт только yc_cloud_id/yc_folder_id.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+default:
+  tags: [yc-runner]
+
+variables:
+  # Стабильное имя кластера из main.tf (${var.name}-cluster). Компонентные job-ы
+  # получают к нему доступ по имени (yc get-credentials --name), без проброски
+  # CLUSTER_ID-dotenv через цепочки needs.
+  CLUSTER_NAME: "otus-ms-cluster"
+
+stages:
+  - validate
+  - plan
+  - apply
+  - bootstrap
+  - infrastructure
+  - destroy
+
+# --- Правила запуска ---------------------------------------------------------
+# Jobs не фильтруются по изменённым файлам: весь pipeline виден на любом коммите.
+# when: always означает «создавать job всегда». Деструктивные/требующие кластера
+# jobs остаются manual на уровне конкретных jobs (terraform_apply,
+# terraform_destroy).
+.infra-rules: &infra_rules
+  - when: always
+
+# --- Terraform ---------------------------------------------------------------
+.tf-base:
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  rules: *infra_rules
+  variables:
+    TF_IN_AUTOMATION:     "1"
+    TF_VAR_yc_cloud_id:   "$YC_CLOUD_ID"
+    TF_VAR_yc_folder_id:  "$YC_FOLDER_ID"
+  before_script:
+    # YC_SA_KEY — переменная типа File: GitLab сохраняет JSON-ключ во временный
+    # файл и возвращает путь к нему.
+    - export YC_SERVICE_ACCOUNT_KEY_FILE="$YC_SA_KEY"
+    # Ключи Object Storage передаём через переменные окружения AWS SDK (в state
+    # они не попадают).
+    - export AWS_ACCESS_KEY_ID="$YC_ACCESS_KEY_ID"
+    - export AWS_SECRET_ACCESS_KEY="$YC_SECRET_ACCESS_KEY"
+    - export TF_CLI_CONFIG_FILE="$CI_PROJECT_DIR/terraform/terraform.rc"
+
+terraform_validate:
+  extends: .tf-base
+  stage: validate
+  # Первый инфраструктурный job — запускается вручную. Дальше инфраструктурная
+  # цепочка идёт автоматически, каждый job ждёт предыдущий через needs.
+  rules:
+    - when: manual
+  script:
+    - cd terraform
+    - terraform fmt -check
+    - terraform init -backend=false
+    - terraform validate
+
+# terraform_plan — только показывает план. apply НЕ берёт сохранённый tfplan,
+# поэтому ошибка "Saved plan is stale" невозможна: apply перестраивает план сам.
+terraform_plan:
+  extends: .tf-base
+  stage: plan
+  needs: [terraform_validate]
+  script:
+    - cd terraform
+    - terraform init -reconfigure "-backend-config=bucket=$TF_STATE_BUCKET"
+    - terraform plan
+
+# terraform_apply — ручной. Выполняет СВЕЖИЙ apply (перестраивает план, без
+# -out/saved plan).
+terraform_apply:
+  extends: .tf-base
+  stage: apply
+  needs: [terraform_plan]
+  rules:
+    - when: manual
+  environment: { name: infrastructure }
+  resource_group: cluster
+  script:
+    - cd terraform
+    - terraform init -reconfigure "-backend-config=bucket=$TF_STATE_BUCKET"
+    - terraform apply -input=false -auto-approve
+    - echo "CLUSTER_ID=$(terraform output -raw cluster_id)" > cluster.env
+  artifacts:
+    reports:
+      dotenv: terraform/cluster.env
+
+# terraform_destroy — manual. Полностью удаляет облачные ресурсы (кластер, node
+# group, сеть, SA, IAM). needs: [] — запускается сразу, не дожидаясь стадий.
+# Порядок удаления задают ссылки ресурсов + depends_on кластера на IAM (см.
+# main.tf); вручную ничего не удаляем. resource_group `cluster` общий с helm-
+# установками.
+terraform_destroy:
+  extends: .tf-base
+  stage: destroy
+  needs: []
+  rules:
+    - when: manual
+  resource_group: cluster
+  environment: { name: infrastructure }
+  script:
+    - cd terraform
+    - terraform init -reconfigure "-backend-config=bucket=$TF_STATE_BUCKET"
+    - terraform destroy -auto-approve
+
+# --- Bootstrap: установка GitLab Agent ---------------------------------------
+# Временный kubeconfig (0600, из лога скрыт, удаляется в after_script). Агент
+# устанавливается и остаётся в кластере. Компонентные job-ы ниже обращаются к
+# кластеру тем же временным kubeconfig-ом от YC-SA, а не через агент.
+# Manual + optional:true: агент ставит/обновляет себя идемпотентно (helm
+# upgrade --install) и получает доступ к кластеру по его ИМЕНИ (CLUSTER_NAME),
+# без артефакта CLUSTER_ID. Поэтому прогон не обязан ждать terraform_apply — на
+# уже поднятом кластере жмёшь job руками, пересобирать облако не нужно.
+install_gitlab_agent:
+  stage: bootstrap
+  image:
+    name: dtzar/helm-kubectl:3
+    entrypoint: [""]
+  rules:
+    - when: manual
+  needs:
+    - job: terraform_apply
+      artifacts: true
+      optional: true
+  environment: { name: dev }
+  resource_group: cluster
+  variables:
+    KUBECONFIG: "$CI_PROJECT_DIR/kubeconfig"
+  before_script:
+    - curl -fsSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh
+        | bash -s -- -i /opt/yc -n >/dev/null
+    - export PATH="/opt/yc/bin:$PATH"
+  script:
+    - yc config profile create ci || true
+    - yc config profile activate ci
+    - yc config set folder-id           "$YC_FOLDER_ID"
+    - yc config set service-account-key "$YC_SA_KEY"
+    - |
+      umask 077
+      yc managed-kubernetes cluster get-credentials \
+        --name "$CLUSTER_NAME" --external --force --kubeconfig "$KUBECONFIG"
+      chmod 600 "$KUBECONFIG"
+    - helm repo add gitlab https://charts.gitlab.io && helm repo update gitlab
+    - |
+      helm upgrade --install otus-agent gitlab/gitlab-agent \
+        -n gitlab-agent --create-namespace --version 2.33.0 \
+        --set image.tag=v19.5.0 \
+        --set config.token="$GITLAB_AGENT_TOKEN" \
+        --set config.kasAddress="$GITLAB_KAS_ADDRESS" \
+        --wait --timeout 5m
+    # Deployment чарта называется <release>-gitlab-agent (не <release>); ждём по
+    # label-селектору чарта — устойчиво к имени/версии чарта.
+    - kubectl -n gitlab-agent rollout status deployment
+        -l app.kubernetes.io/name=gitlab-agent,app.kubernetes.io/instance=otus-agent --timeout=2m
+  after_script:
+    - rm -f "$CI_PROJECT_DIR/kubeconfig"
+
+# --- Cluster components ------------------------------------------------------
+# Manual + needs: []: компоненты (ingress/monitoring/логи/дашборды) ставятся
+# идемпотентно (helm upgrade --install + kubectl apply) и получают kubeconfig сами
+# через yc get-credentials по имени кластера. После первой настройки, когда
+# кластер и агент уже подняты, достаточно запустить ЭТУ job — terraform_apply и
+# установку агента заново прогонять не нужно.
+install_cluster_components:
+  stage: infrastructure
+  image:
+    name: dtzar/helm-kubectl:3
+    entrypoint: [""]
+  rules:
+    - when: manual
+  needs: []
+  environment: { name: dev }
+  resource_group: cluster
+  variables:
+    KUBECONFIG: "$CI_PROJECT_DIR/kubeconfig"
+  # В docker-executor «голые» helm/kubectl не могут обратиться через GitLab Agent
+  # (нет agent-kubeconfig -> helm падал на localhost:8080). Тут тот же путь, что в
+  # install_gitlab_agent: временный kubeconfig от YC-SA, живёт только во время job.
+  # Сам агент остаётся установленным и используется другими job-ами.
+  before_script:
+    - curl -fsSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i /opt/yc -n >/dev/null
+    - export PATH="/opt/yc/bin:$PATH"
+    - yc config profile create ci >/dev/null 2>&1 || true
+    - yc config profile activate ci
+    - yc config set folder-id "$YC_FOLDER_ID"
+    - yc config set service-account-key "$YC_SA_KEY"
+    - umask 077 && yc managed-kubernetes cluster get-credentials --name "$CLUSTER_NAME" --external --force --kubeconfig "$KUBECONFIG"
+  after_script:
+    - rm -f "$KUBECONFIG"
+  script:
+    - helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    - helm repo add grafana https://grafana.github.io/helm-charts
+    - helm repo update
+    # ingress-nginx: дождаться внешнего IP LB (нужен для nip.io-хостов ниже).
+    - |
+      helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+        -n ingress-nginx --create-namespace --version 4.15.1 \
+        -f helm/monitoring/values-ingress-nginx.yaml --wait --timeout 10m
+      kubectl -n ingress-nginx wait \
+        --for=jsonpath='{.status.loadBalancer.ingress}' \
+        svc/ingress-nginx-controller --timeout=5m
+      LB=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+             -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    # kube-prometheus-stack: дождаться готовности CRD мониторинга (ServiceMonitor
+    # и др.) — они нужны для подключения будущего приложения к мониторингу.
+    - |
+      helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+        -n monitoring --create-namespace --version 69.8.2 \
+        -f helm/monitoring/values-kube-prometheus-stack.yaml \
+        --set "grafana.ingress.hosts[0]=grafana.$LB.nip.io" \
+        --wait --timeout 10m
+      kubectl wait --for=condition=Established \
+        crd/servicemonitors.monitoring.coreos.com --timeout=2m
+    # Loki + Alloy (namespace logging).
+    - |
+      helm upgrade --install loki grafana/loki \
+        -n logging --create-namespace --version 6.55.0 \
+        -f helm/monitoring/values-loki.yaml --wait --timeout 10m
+      helm upgrade --install alloy grafana/alloy \
+        -n logging --create-namespace --version 1.15.0 \
+        --set image.tag=v1.21.3 \
+        -f helm/monitoring/values-alloy.yaml --wait --timeout 5m
+    # Дашборды Grafana: sidecar (см. values-kube-prometheus-stack.yaml) подхватывает
+    # ConfigMap в namespace monitoring с лейблом grafana_dashboard=1, ключ должен
+    # заканчиваться на .json. apply идемпотентен — повторный запуск обновляет JSON.
+    - |
+      for d in app-red app-logs; do
+        kubectl -n monitoring create configmap "grafana-dash-$d" \
+          "--from-file=$d.json=helm/monitoring/dashboards/$d.json" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        kubectl -n monitoring label configmap "grafana-dash-$d" \
+          grafana_dashboard=1 --overwrite
+      done
+      

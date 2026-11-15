@@ -1,0 +1,65 @@
+# Grafana Alloy — сборщик логов подов кластера. Один Deployment (replicas: 1, НЕ
+# DaemonSet): loki.source.kubernetes читает логи через API Kubernetes, поэтому
+# одного экземпляра хватает на все поды кластера. Namespace: logging.
+# Путь логов: loki.source.kubernetes -> loki.write, без промежуточной обработки.
+
+controller:
+  type: deployment
+  replicas: 1
+
+image:
+  tag: v1.21.3
+
+alloy:
+  configMap:
+    create: true
+    content: |
+      logging {
+        level  = "info"
+        format = "logfmt"
+      }
+
+      discovery.kubernetes "pods" {
+        role = "pod"
+      }
+
+      // namespace/pod/container-метки добавляет сам loki.source.kubernetes.
+      loki.source.kubernetes "pods" {
+        targets    = discovery.kubernetes.pods.targets
+        forward_to = [loki.process.app.receiver]
+      }
+
+      // Логи приложения (namespace dev) приходят структурированным ECS JSON в
+      // stdout. Извлекаем service.name и log.level и поднимаем их в лейблы
+      // потока. Имя лейбла не может содержать точку, поэтому service.name ->
+      // service_name (значение остаётся прежним). Логи вне dev проходят насквозь
+      // без этих лейблов.
+      loki.process "app" {
+        stage.match {
+          selector = "{namespace=\"dev\"}"
+
+          stage.json {
+            expressions = {
+              service_name = "\"service.name\"",
+              level        = "\"log.level\"",
+            }
+          }
+
+          stage.labels {
+            values = {
+              service_name = "",
+            }
+          }
+        }
+
+        forward_to = [loki.write.loki.receiver]
+      }
+
+      loki.write "loki" {
+        endpoint {
+          url = "http://loki.logging.svc.cluster.local:3100/loki/api/v1/push"
+        }
+      }
+
+resources:
+  requests: { cpu: 20m, memory: 128Mi }

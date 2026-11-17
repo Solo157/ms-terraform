@@ -30,7 +30,6 @@ variable "subnet_cidr" {
   description = "CIDR единственной подсети VPC"
   type        = string
   default     = "10.97.0.0/16"
-  #   default     = "10.10.10.0/24"
 }
 
 # CIDR Kubernetes. Задаются ЯВНО (не по умолчанию провайдера), не должны

@@ -15,7 +15,7 @@ yc_folder_id = "<YC_FOLDER_ID>"
 # удаления зависимых ресурсов: смена zone или CIDR уже занятой подсети = ForceNew
 # (пересоздание подсети/кластера/нoд).
 zone        = "ru-central1-d"
-subnet_cidr = "10.10.10.0/24"
+subnet_cidr = "10.97.0.0/16"
 
 # Kubernetes-сети задаются явно, не должны пересекаться с subnet и между собой.
 cluster_ipv4_range = "10.244.0.0/16" # Pod'ы

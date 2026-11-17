@@ -29,11 +29,7 @@ alloy:
         forward_to = [loki.process.app.receiver]
       }
 
-      // Логи приложения (namespace dev) приходят структурированным ECS JSON в
-      // stdout. Извлекаем service.name и log.level и поднимаем их в лейблы
-      // потока. Имя лейбла не может содержать точку, поэтому service.name ->
-      // service_name (значение остаётся прежним). Логи вне dev проходят насквозь
-      // без этих лейблов.
+      // Для логов приложения добавляем service_name как label потока.
       loki.process "app" {
         stage.match {
           selector = "{namespace=\"dev\"}"
@@ -41,7 +37,6 @@ alloy:
           stage.json {
             expressions = {
               service_name = "\"service.name\"",
-              level        = "\"log.level\"",
             }
           }
 

@@ -98,10 +98,6 @@ terraform_apply:
     - cd terraform
     - terraform init -reconfigure "-backend-config=bucket=$TF_STATE_BUCKET"
     - terraform apply -input=false -auto-approve
-    - echo "CLUSTER_ID=$(terraform output -raw cluster_id)" > cluster.env
-  artifacts:
-    reports:
-      dotenv: terraform/cluster.env
 
 # terraform_destroy — manual. Полностью удаляет облачные ресурсы (кластер, node
 # group, сеть, SA, IAM). needs: [] — запускается сразу, не дожидаясь стадий.
@@ -125,10 +121,8 @@ terraform_destroy:
 # Временный kubeconfig (0600, из лога скрыт, удаляется в after_script). Агент
 # устанавливается и остаётся в кластере. Компонентные job-ы ниже обращаются к
 # кластеру тем же временным kubeconfig-ом от YC-SA, а не через агент.
-# Manual + optional:true: агент ставит/обновляет себя идемпотентно (helm
-# upgrade --install) и получает доступ к кластеру по его ИМЕНИ (CLUSTER_NAME),
-# без артефакта CLUSTER_ID. Поэтому прогон не обязан ждать terraform_apply — на
-# уже поднятом кластере жмёшь job руками, пересобирать облако не нужно.
+# Устанавливается вручную на уже созданный кластер. Получает kubeconfig по имени,
+# поэтому не зависит от Terraform artifact и может повторно обновить Agent.
 install_gitlab_agent:
   stage: bootstrap
   image:
@@ -136,10 +130,7 @@ install_gitlab_agent:
     entrypoint: [""]
   rules:
     - when: manual
-  needs:
-    - job: terraform_apply
-      artifacts: true
-      optional: true
+  needs: []
   environment: { name: dev }
   resource_group: cluster
   variables:
@@ -239,15 +230,11 @@ install_cluster_components:
         -n logging --create-namespace --version 1.15.0 \
         --set image.tag=v1.21.3 \
         -f helm/monitoring/values-alloy.yaml --wait --timeout 5m
-    # Дашборды Grafana: sidecar (см. values-kube-prometheus-stack.yaml) подхватывает
-    # ConfigMap в namespace monitoring с лейблом grafana_dashboard=1, ключ должен
-    # заканчиваться на .json. apply идемпотентен — повторный запуск обновляет JSON.
+    # Grafana sidecar подхватывает ConfigMap по label и JSON-ключу.
     - |
-      for d in app-red app-logs; do
-        kubectl -n monitoring create configmap "grafana-dash-$d" \
-          "--from-file=$d.json=helm/monitoring/dashboards/$d.json" \
-          --dry-run=client -o yaml | kubectl apply -f -
-        kubectl -n monitoring label configmap "grafana-dash-$d" \
-          grafana_dashboard=1 --overwrite
-      done
+      kubectl -n monitoring create configmap grafana-dash-app-observability \
+        --from-file=app-observability.json=helm/monitoring/dashboards/app-observability.json \
+        --dry-run=client -o yaml | kubectl apply -f -
+      kubectl -n monitoring label configmap grafana-dash-app-observability \
+        grafana_dashboard=1 --overwrite
       

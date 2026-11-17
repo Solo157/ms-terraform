@@ -109,8 +109,8 @@ backend'а подаются отдельными переменными, сек�
 
 ## Порядок запуска инфраструктурного пайплайна
 
-Триггер — коммит, затрагивающий `terraform/**`, `helm/monitoring/**` или конфиг
-агента.
+Pipeline создаётся для branch, merge request и tag событий; jobs не фильтруются
+по изменённым путям. `terraform_validate` и кластерные установки запускаются вручную.
 
 1. `terraform_validate` (стадия `validate`): `cd terraform && terraform fmt -check
    && terraform init -backend=false && terraform validate`.
@@ -118,20 +118,20 @@ backend'а подаются отдельными переменными, сек�
    -backend-config=bucket=$TF_STATE_BUCKET` и `terraform plan` (только показывает
    план; сохранённый `tfplan` дальше не используется — apply строит план заново,
    поэтому «Saved plan is stale» исключён).
-3. `terraform_apply` (стадия `apply`, **manual** — сам не запускается): выполняет
-   свежий `terraform apply -input=false -auto-approve` и пишет `CLUSTER_ID` в
-   `cluster.env` (dotenv-артефакт).
-4. `install_gitlab_agent` (стадия `bootstrap`, после apply, берёт `CLUSTER_ID`):
-   YC CLI получает временный kubeconfig (файл `0600`, живёт только во время джобы) и
-   ставит GitLab Agent в namespace `gitlab-agent`. kubeconfig удаляется в
-   `after_script`.
-5. `install_cluster_components` (стадия `infrastructure`, после агента): разворачивает
+3. `terraform_apply` (стадия `apply`, **manual**): выполняет свежий
+   `terraform apply -input=false -auto-approve`.
+4. `install_gitlab_agent` (стадия `bootstrap`, **manual**): независимо от Terraform
+   job получает временный kubeconfig по `CLUSTER_NAME` и ставит/обновляет Agent
+   в namespace `gitlab-agent`. Кластер к этому моменту должен существовать.
+5. `install_cluster_components` (стадия `infrastructure`, **manual**, независимо
+   от установки Agent): разворачивает
    ingress-nginx (ждёт внешний IP балансировщика), kube-prometheus-stack (Grafana на
    `grafana.<LB>.nip.io`), Loki и Alloy. Все установки через `helm upgrade
    --install` — повторный запуск безопасен.
 
-Каждая job-а компонентов получает свой временный kubeconfig через
-`yc get-credentials` и удаляет его в `after_script`.
+Каждая job компонентов получает временный kubeconfig через `yc get-credentials`
+и удаляет его в `after_script`. Agent не используется этими CI jobs как транспорт
+доступа к Kubernetes: они подключаются напрямую через YC CLI.
 
 ## Удаление инфраструктуры
 

@@ -36,30 +36,6 @@
 | ingress-nginx, kube-prometheus-stack, Loki, Alloy | CI `install_cluster_components` (Helm через агент) |
 | bucket Object Storage + ключи, SA YC + ключ, агент-токен | оператор, разово (см. «Первоначальная настройка») |
 
-### Namespace'ы
-
-| Namespace | Содержимое |
-|---|---|
-| `gitlab-agent` | GitLab Agent |
-| `ingress-nginx` | ingress-nginx (LoadBalancer) |
-| `monitoring` | Prometheus, Grafana (Alertmanager выключен) |
-| `logging` | Loki, Alloy |
-
-## Структура
-
-```
-terraform/                   один корень, один state, без модулей:
-  main.tf           сеть, SG, кластер, node group, SA + IAM
-  variables.tf  outputs.tf  providers.tf  versions.tf  backend.tf
-  terraform.tfvars.example   образец terraform.tfvars (реальный tfvars не коммитим)
-helm/monitoring/             только values для внешних чартов (своих чартов нет):
-  values-ingress-nginx.yaml  values-kube-prometheus-stack.yaml
-  values-loki.yaml  values-alloy.yaml
-.gitlab/agents/otus-agent/config.yaml   ci_access на проект
-.gitlab-ci.yml               один pipeline, 6 стадий; apply и destroy — ручные,
-                             apply строит план заново (без saved tfplan)
-```
-
 ## GitLab CI/CD Variables
 
 Auto (предопределённые GitLab — руками не задавать): `CI_PROJECT_PATH`,
@@ -133,23 +109,6 @@ Pipeline создаётся для branch, merge request и tag событий; 
 и удаляет его в `after_script`. Agent не используется этими CI jobs как транспорт
 доступа к Kubernetes: они подключаются напрямую через YC CLI.
 
-## Удаление инфраструктуры
-
-`terraform_destroy` (стадия `destroy`, **manual**): `terraform init -reconfigure …`
-и `terraform destroy -auto-approve`. Порядок удаления задают сами ссылки ресурсов
-(нода→кластер→SA/сеть; кластер `depends_on` IAM-роли master SA, поэтому роли
-снимаются после кластера) — вручную зависимости не удаляем. `needs: []` позволяет
-запустить destroy и первым. Job в `resource_group: cluster` и не стартует
-одновременно с helm-установками из другого пайплайна.
-
-Yandex Cloud удаляет кластер, node group и их сетевые интерфейсы асинхронно:
-иногда SG/subnet/SA мгновение «держат ссылки» на уже удаляемые узлы. Если destroy
-вернул `FailedPrecondition` об этом — корректный шаг: дождаться завершения
-асинхронного удаления и перезапустить тот же `terraform destroy`. Если ссылки
-указывают на ресурсы, которых нет в `terraform state list` (остатки неудавшихся
-apply) — сначала вернуть их под управление через `terraform import`, затем destroy.
-`state rm` для сокрытия проблемы не используем.
-
 ## Проверка после развёртывания
 
 - Grafana: `http://grafana.<LB>.nip.io` (`admin`/`admin`). Готовые панели
@@ -159,24 +118,3 @@ apply) — сначала вернуть их под управление чер
   `pod`, `container`.
 
 IP балансировщика: `kubectl -n ingress-nginx get svc ingress-nginx-controller`.
-
-## Известные ограничения демо
-
-- Одна зона (по умолчанию `ru-central1-d`), фиксированный размер Node Group
-  (1 нода, 2 vCPU, 4 ГБ, диск 32 ГБ — минимум для Managed Kubernetes). Перед
-  применением проверить квоты YC: vCPU, RAM, число VM, диски и их размер,
-  Managed Kubernetes, доступность `standard-v3` в выбранной зоне — лимит vCPU в
-  зоне может быть равен 2 (ровно одна нода запаса не оставляет).
-- Grafana admin-пароль в значениях чарта (только демо).
-- Loki — SingleBinary, `filesystem`, retention 48h, без HA; сбор логов одним
-  Alloy Deployment (не DaemonSet).
-- Alertmanager намеренно выключен.
-- GitLab Agent получает широкие RBAC-права в кластере — для продакшена их сузить.
-
-## Локальные проверки и реальный YC
-
-Локально проходят: `terraform fmt`/`validate`, проверка синтаксиса
-`.gitlab-ci.yml`. Полный `terraform apply`, развёртывание агента, получение
-внешнего IP, реальная работа Prometheus/Grafana/Loki проверяются только запуском в
-Yandex Cloud. Для `yc get-credentials` адрес GitLab Runner должен быть в allowlist
-master-узла кластера.
